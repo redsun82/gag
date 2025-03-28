@@ -12,6 +12,14 @@ on:
   pull_request:
     branches:
     - main
+    paths:
+    - foo/**
+    - bar/**
+    - '!baz/**'
+  push:
+    tags:
+    - main
+    - '!v1.0.0'
   workflow_dispatch: {}
 jobs:
   test_basic:
@@ -23,7 +31,9 @@ jobs:
 )
 def test_basic():
     name("My workflow")
-    on.pull_request(branches=["main"])
+    new_on.pull_request(branches=["main"])
+    new_on.pull_request.paths("foo/**", "bar/**", "!baz/**")
+    new_on.push.tags("main", "!v1.0.0")
     on.workflow_dispatch()
     run("")
 

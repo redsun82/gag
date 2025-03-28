@@ -3,6 +3,7 @@ import dataclasses
 import inspect
 import itertools
 import textwrap
+import types
 import typing
 from dataclasses import dataclass, fields, asdict
 import pathlib
@@ -167,6 +168,218 @@ class _Context(ContextBase):
                 f"`{reason}` is a `job` field, but implicit job cannot be created because there are already jobs in the workflow",
             )
         return job
+
+
+type _Path = tuple[str | int, ...]
+
+
+def _type(path: _Path) -> type | None:
+    t = Workflow
+    for p in path:
+        o = typing.get_origin(t)
+        match p:
+            case str() if issubclass(o or t, Element):
+                f = next((f for f in fields(o or t) if f.name == p), None)
+                assert f is not None, f"no `{p}` field in `{t.__name__}`"
+                t = f.type
+                if typing.get_origin(t) is types.UnionType:
+                    t = typing.get_args(t)[0]
+            case str() if o is dict:
+                t = typing.get_args(t)[1]
+            case int() if o is list and p >= 0:
+                t = typing.get_args(t)[0]
+            case _:
+                assert False, f"unexpected access by `{p!r}` in `{t}`"
+        if t is Value:
+            t = str
+    return t
+
+
+def _ensure_element(start: Workflow | Job, path: tuple[str | int, ...]) -> typing.Any:
+    assert start
+    e = start
+    t = type(e)
+    for p in path:
+        match e, p:
+            case _, str() if issubclass(t, Element):
+                f = next((f for f in fields(t) if f.name == p), None)
+                assert f is not None, f"no `{p}` field in `{t.__name__}`"
+                t = f.type
+                if typing.get_origin(t) is types.UnionType:
+                    t = typing.get_args(t)[0]
+                next_e = getattr(e, p)
+                if next_e is None:
+                    next_e = t()
+                    setattr(e, p, next_e)
+                e = next_e
+            case list(), int() if p >= 0:
+                t = typing.get_args(t)[0]
+                e.extend([t() for _ in range(len(e), p + 1)])
+                e = e[p]
+            case dict(), str():
+                t = typing.get_args(t)[1]
+                e = e.setdefault(p, t())
+            case _:
+                assert False, f"unexpected access by `{p!r}` in `{t}`"
+    return e
+
+
+def _get_workflow(path: tuple[str | int, ...]) -> Workflow:
+    if _ctx.current_workflow is None or _ctx.current_job is not None:
+        _ctx.error(f"`{".".join(path)} must be used in a workflow")
+        return Workflow()
+    return _ctx.current_workflow
+
+
+def _get_job(path: tuple[str | int, ...]) -> Job:
+    if _ctx.current_job is None:
+        path = ".".join(path)
+        if _ctx.current_workflow:
+            return _ctx.auto_job(path)
+        _ctx.error(f"`{path}` must be used in a job")
+        return Job()
+    return _ctx.current_job
+
+
+def _get_job_or_workflow(path: tuple[str | int, ...]) -> Workflow | Job:
+    ret = _ctx.current_job or _ctx.current_workflow
+    if ret is None:
+        _ctx.error(f"`{".".join(path)}` must be used in a workflow or a job")
+        return Workflow()
+    return ret
+
+
+def _update_element(
+    value: typing.Any, start: Workflow | Job, path: tuple[str | int, ...]
+):
+    prefix, field = path[:-1], path[-1]
+    parent = _ensure_element(start, prefix)
+    old_value = getattr(parent, field)
+    new_value = _merge(".".join(map(str, path)), old_value, value)
+    if new_value is not None:
+        setattr(parent, field, new_value)
+
+
+def _update_wf_element(value: typing.Any, *path: str | int):
+    _update_element(value, _get_workflow(path), path)
+
+
+def _update_j_element(value: typing.Any, *path: str | int):
+    _update_element(value, _get_job(path), path)
+
+
+def _update_wf_j_element(value: typing.Any, *path: str | int) -> typing.Any:
+    _update_element(value, _get_job_or_workflow(path), path)
+
+
+def _seq_from_args(
+    arg: str | typing.Iterable[str] | None, rest: tuple[str, ...]
+) -> list[str] | None:
+    match arg, rest:
+        case str(), _:
+            ret = [arg]
+            ret.extend(rest)
+            return ret
+        case None, ():
+            return None
+        case list(), ():
+            return arg
+        case _, ():
+            return list(arg)
+        case _:
+            raise TypeError("only one non-string argument accepted")
+
+
+class _NewOnUpdater:
+    class PullRequestUpdater:
+        _field = "pull_request"
+
+        def branches(
+            self, branches: str | typing.Iterable[str] | None = None, *rest: str
+        ) -> typing.Self:
+            _update_wf_element(
+                _seq_from_args(branches, rest), "on", self._field, "branches"
+            )
+            return self
+
+        def ignore_branches(
+            self, branches: str | typing.Iterable[str] | None = None, *rest: str
+        ) -> typing.Self:
+            _update_wf_element(
+                _seq_from_args(branches, rest), "on", self._field, "ignore_branches"
+            )
+            return self
+
+        def paths(
+            self, paths: str | typing.Iterable[str] | None = None, *rest: str
+        ) -> typing.Self:
+            _update_wf_element(_seq_from_args(paths, rest), "on", self._field, "paths")
+            return self
+
+        def ignore_paths(
+            self, paths: str | typing.Iterable[str] | None = None, *rest: str
+        ) -> typing.Self:
+            _update_wf_element(
+                _seq_from_args(paths, rest), "on", self._field, "ignore_paths"
+            )
+            return self
+
+        def __call__(
+            self,
+            *,
+            branches: typing.Iterable[str] | None = None,
+            ignore_branches: typing.Iterable[str] | None = None,
+            paths: typing.Iterable[str] | None = None,
+            ignore_paths: typing.Iterable[str] | None = None,
+        ):
+            self.branches(branches)
+            self.ignore_branches(ignore_branches)
+            self.paths(paths)
+            self.ignore_paths(ignore_paths)
+            return self
+
+    class PushUpdater(PullRequestUpdater):
+        _field = "push"
+
+        def tags(
+            self, paths: str | typing.Iterable[str] | None = None, *rest: str
+        ) -> typing.Self:
+            _update_wf_element(_seq_from_args(paths, rest), "on", self._field, "tags")
+            return self
+
+        def ignore_tags(
+            self, paths: str | typing.Iterable[str] | None = None, *rest: str
+        ) -> typing.Self:
+            _update_wf_element(
+                _seq_from_args(paths, rest), "on", self._field, "ignore_tags"
+            )
+            return self
+
+        def __call__(
+            self,
+            *,
+            branches: typing.Iterable[str] | None = None,
+            ignore_branches: typing.Iterable[str] | None = None,
+            paths: typing.Iterable[str] | None = None,
+            ignore_paths: typing.Iterable[str] | None = None,
+            tags: typing.Iterable[str] | None = None,
+            ignore_tags: typing.Iterable[str] | None = None,
+        ):
+            super().__call__(
+                branches=branches,
+                ignore_branches=ignore_branches,
+                paths=paths,
+                ignore_paths=ignore_paths,
+            )
+            self.tags(tags)
+            self.ignore_tags(ignore_tags)
+            return self
+
+    pull_request = PullRequestUpdater()
+    push = PushUpdater()
+
+
+new_on = _NewOnUpdater()
 
 
 class _Updaters:
